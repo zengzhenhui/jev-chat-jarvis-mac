@@ -18,6 +18,7 @@ import urllib.request
 import numpy as np
 
 import userconfig
+import runtime_mode
 
 # 描述保持这个长度是有实测依据的，别为了省 prefill 时间去瘦身：两轮压缩措辞
 # （保语义锚点、每条砍 ~1/3 字符）在 22 条回归上分别是 81.8% 和 77.3%，都低于
@@ -220,6 +221,8 @@ def download_block_reason(repo: str = "Mapika/decider-2b") -> str | None:
     the model while refusing to start a surprise download for the rest (#38).
     """
     pref = userconfig.get("JUDGE_BACKEND").strip().lower()
+    if runtime_mode.intel_mac() or pref == "api":
+        return "当前为 API 模式，不下载或加载本地模型；请在模型设置中配置 API。"
     if pref == "local":
         return None                      # explicit opt-in: download is the point
     if pref == "cloud":
@@ -350,6 +353,8 @@ class Judge:
     """Wraps a decoder-only decision model; lazy-loads on first use."""
 
     def __init__(self, repo: str = "Mapika/decider-2b", device: str | None = None):
+        if runtime_mode.api_only():
+            raise ModelNotDownloadedError("当前为 API 模式，本地判断不可用；请在模型设置中配置 API。")
         import torch
 
         self.torch = torch
@@ -563,6 +568,8 @@ class FallbackJudge:
                 else f"本地 {self.local.repo.split('/')[-1]}，一次前向")
 
     def _fallback(self):
+        if runtime_mode.api_only():
+            raise RuntimeError("判断 API 暂不可用；API 模式不会回退到本地模型，请检查密钥和服务状态。")
         if self.local is None:
             self.local = Judge()
         return self.local
@@ -572,6 +579,8 @@ class FallbackJudge:
             try:
                 return self.primary.judge(message, context)
             except Exception as e:
+                if runtime_mode.api_only():
+                    raise
                 self.fell_back = True
                 self.reason = type(e).__name__
         out = self._fallback().judge(message, context)
@@ -583,6 +592,8 @@ class FallbackJudge:
             try:
                 return self.primary.rank_candidates(message, intent, candidates, context)
             except Exception as e:
+                if runtime_mode.api_only():
+                    raise
                 self.fell_back = True
                 self.reason = type(e).__name__
         return self._fallback().rank_candidates(message, intent, candidates, context)
@@ -591,12 +602,30 @@ class FallbackJudge:
         return None
 
 
+class PausedJudge:
+    """Honor the saved 'later' choice without any judgment/ranking requests."""
+    name = "paused"
+    backend_label = "判断已暂停（JUDGE_BACKEND=skip）"
+    load_status = None
+
+    def warm(self):
+        return None
+
+    def judge(self, message: str, context: str | None = None):
+        raise ModelNotDownloadedError("判断已暂停：在配置文件中将 JUDGE_BACKEND 改为 api 并重启。")
+
+    def rank_candidates(self, message: str, intent: str, candidates: list[str], context: str | None = None):
+        raise ModelNotDownloadedError("判断已暂停，未请求在线排序。")
+
+
 def make_judge():
-    """Jev when a key is configured, otherwise the local decider-2b."""
-    try:
-        import judge_jev
-        if judge_jev.jev_configured():
-            return FallbackJudge()
-    except Exception:
-        pass
+    """API-only on Intel/lean installs; preserve opt-in ARM local inference."""
+    if userconfig.get("JUDGE_BACKEND").strip().lower() == "skip":
+        return PausedJudge()
+    import judge_jev
+    if judge_jev.jev_configured():
+        return FallbackJudge()
+    if runtime_mode.api_only():
+        from judge_api import APIJudge
+        return APIJudge()
     return Judge()

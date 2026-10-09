@@ -76,7 +76,7 @@ class SettingsController(NSObject):
         self.tabs = A.NSTabView.alloc().initWithFrame_(NSMakeRect(24, 184, 712, 326))
         if hasattr(self.tabs, "setDrawsBackground_"):
             self.tabs.setDrawsBackground_(False)
-        titles = ("判断 · Jev", "生成 · OpenAI 兼容", "生成 · Anthropic 兼容")
+        titles = ("判断 · Jev", "OpenAI 兼容 API", "Anthropic 兼容 API")
         for index, (prefix, title) in enumerate(zip(config.PREFIXES, titles)):
             item = A.NSTabViewItem.alloc().initWithIdentifier_(prefix)
             item.setLabel_(title)
@@ -143,6 +143,8 @@ class SettingsController(NSObject):
                 self.controls.append(button)
             item.setView_(panel)
             self.tabs.addTabViewItem_(item)
+        if judge.runtime_mode.api_only():
+            self.tabs.selectTabViewItemWithIdentifier_("OPENAI")
         self.build_context_tab()
         view.addSubview_(self.tabs)
         # #38: 离线判断模型管理。删除是显式确认动作；「启用」只写选择，真正的
@@ -161,7 +163,7 @@ class SettingsController(NSObject):
         priority_surface = ui_style.make_surface(10, PALETTE["row"], PALETTE["edge"])
         priority_surface.setFrame_(NSMakeRect(24, 74, 710, 44))
         view.addSubview_(priority_surface)
-        self.label(view, "优先级：环境变量 > 用户 env > 项目 .env > 内置；两组生成密钥同时存在时 OpenAI 优先。\n清空此文件的密钥不屏蔽其他来源；切换服务需清除原来源中的优先密钥。", 36, 80, 686, 32, 11, PALETTE["muted"])
+        self.label(view, "API 模式：无 Jev 密钥时，判断/排序共用生成 API；分数为模型估计。\n聊天内容和上下文会发送至您配置的服务，可能收费。OpenAI 密钥优先；保存后重启。", 36, 80, 686, 32, 11, PALETTE["muted"])
         self.status = self.label(view, "测试会发送固定问候语，不读取聊天内容；可能产生少量服务费用。", 24, 26, 550, 38, 11, PALETTE["muted"])
         self.set_status(self.status.stringValue())
         self.save_button = self.button(view, "保存配置", "saveSettings:", 602, 29, 132, True)
@@ -411,6 +413,11 @@ class SettingsController(NSObject):
 
     @objc.python_method
     def refresh_offline_section(self):
+        if judge.runtime_mode.api_only():
+            self.offline_label.setStringValue_("API 模式 · 不加载本地模型；配置上方服务即可，无需下载权重")
+            self.offline_delete_btn.setHidden_(True)
+            self.offline_enable_btn.setHidden_(True)
+            return
         cached = judge.model_cached()
         if cached:
             text = f"离线判断模型：已下载（{judge.model_disk_usage() / 1e9:.1f} GB 磁盘占用）"
@@ -453,6 +460,9 @@ class SettingsController(NSObject):
             self.set_status("已删除离线判断模型。正在运行的判断不受影响；删除的文件不可恢复。", "success")
 
     def enableOfflineModel_(self, sender):
+        if judge.runtime_mode.api_only():
+            self.set_status("当前安装为 API 模式；Intel Mac 不支持本地模型。", "error")
+            return
         alert = A.NSAlert.alloc().init()
         alert.setMessageText_("启用离线判断？")
         alert.setInformativeText_("下次启动的预热将下载判断模型（约 3.8 GB，一次性），之后判断完全离线进行。")
@@ -613,7 +623,8 @@ class SettingsController(NSObject):
                 if listing:
                     result["models"] = config.list_models(*args)
                 else:
-                    config.test_connection(*args, values["MODEL"], extra)
+                    config.test_connection(*args, values["MODEL"], extra,
+                                           structured=judge.runtime_mode.api_only())
             except Exception as e:
                 result["error"] = config.error_message(e)
             self.performSelectorOnMainThread_withObject_waitUntilDone_("requestFinished:", result, False)
@@ -630,7 +641,7 @@ class SettingsController(NSObject):
             self.set_models(combo, result["models"])
             self.set_status(f"已获取 {len(result['models'])} 个模型。请从下拉列表选择或手填，再测试连接。", "success")
         else:
-            self.set_status("连接成功：所填服务与模型返回了有效结果。配置尚需保存并重启生效。", "success")
+            self.set_status("连接成功：所填服务与模型返回了有效结果（API 模式已校验 JSON 判断）。保存后重启生效。", "success")
 
     def windowShouldClose_(self, sender):
         if self.busy:

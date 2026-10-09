@@ -24,4 +24,11 @@ if ! jev_ensure_uv "$LOG"; then
     exit 1
 fi
 
-exec uv run python src/hud.py
+if ! jev_resolve_backend "$PWD"; then
+    print -r -- "无法读取判断模式配置，请检查 Python 环境后重试。"
+    exit 1
+fi
+if jev_use_local; then
+    exec uv run --locked --extra local python src/hud.py
+fi
+exec uv run --locked python src/hud.py

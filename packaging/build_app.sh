@@ -54,7 +54,7 @@ cd "$ROOT"
 cp -R src "$APP/Contents/Resources/app/src"
 cp pyproject.toml uv.lock README.md .python-version "$APP/Contents/Resources/app/"
 mkdir -p "$APP/Contents/Resources/app/packaging"
-cp packaging/bootstrap_uv.sh "$APP/Contents/Resources/app/packaging/"
+cp packaging/bootstrap_uv.sh packaging/backend_mode.py "$APP/Contents/Resources/app/packaging/"
 # MIT requires the copyright notice to travel with a distributed copy;
 # NOTICE asks the same of itself on redistribution (#86)
 if [ -f LICENSE ]; then cp LICENSE "$APP/Contents/Resources/app/"; fi
@@ -80,11 +80,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>        <string>jev-jarvis</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
-    <!-- torch ships no x86_64 macOS wheel (#19): keep the app on arm64 even when
-         Finder "Open using Rosetta" is ticked, instead of dying at first uv sync -->
+    <!-- API-only base supports native Apple Silicon and Intel. -->
     <key>LSArchitecturePriority</key>
     <array>
         <string>arm64</string>
+        <string>x86_64</string>
     </array>
     <!-- floating helper: no Dock icon, never becomes the active app -->
     <key>LSUIElement</key>               <true/>
@@ -108,7 +108,7 @@ export PYTHONDONTWRITEBYTECODE=1  # keep the signed app bundle immutable at runt
 RES="$(cd "$(dirname "$0")" && pwd)"
 SUPPORT="$HOME/Library/Application Support/jev-jarvis"
 CONFIG="$HOME/.config/jev-jarvis"
-VENV="$SUPPORT/venv"
+VENV="$SUPPORT/venv-$(uname -m)"
 LOG="$HOME/Library/Logs/jev-jarvis.log"
 mkdir -p "$SUPPORT" "$(dirname "$LOG")"
 
@@ -141,28 +141,21 @@ export UV_PROJECT_ENVIRONMENT="$VENV"
 export USE_TF=0                  # laya/transformers: skip the TensorFlow probe
 export HF_HUB_DISABLE_TELEMETRY=1
 
-# The venv must exist AND be the interpreter this bundle pins (@PYTHON_PIN@, written by
-# build_app.sh). uv keeps an existing environment as-is, so a venv built by a different
-# python would silently survive a rebuild — treat a mismatch like a missing venv.
-ready=0
-if [ -x "$VENV/bin/python" ]; then
-    found="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '?')"
-    if [ "$found" = "@PYTHON_PIN@" ]; then
-        ready=1
-    else
-        log "虚拟环境是 Python $found，本包需要 @PYTHON_PIN@ —— 重建"
-    fi
+# Synchronize on every launch so upgrades and backend changes cannot keep stale
+# dependencies. The lockfile is shipped; uv does not re-resolve it at runtime.
+# Architecture-specific environments avoid reusing an ARM Python under Rosetta.
+log "正在检查运行环境（首次安装需联网）"
+if ! jev_resolve_backend "$RES/app"; then
+    die "无法读取判断模式配置，请检查日志"
 fi
-
-if [ "$ready" = 0 ]; then
-    rm -rf "$VENV"
-    log "正在创建虚拟环境并安装依赖（需要几分钟，请保持联网）"
-    osascript -e 'display notification "正在准备运行环境（几分钟，需联网）" with title "jev-chat-jarvis"' >/dev/null 2>&1
-    # --frozen: use the shipped uv.lock exactly, never re-resolve at runtime
-    if ! uv sync --frozen --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
-        die "依赖安装失败，请查看日志"
+if jev_use_local; then
+    if ! uv sync --frozen --extra local --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
+        die "本地模式依赖安装失败，请查看日志"
     fi
-    log "依赖安装完成"
+else
+    if ! uv sync --frozen --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
+        die "API 模式依赖安装失败，请查看日志"
+    fi
 fi
 
 log "启动 hud.py"
@@ -184,7 +177,7 @@ if ! xcrun --find clang >/dev/null 2>&1; then
     exit 1
 fi
 xcrun clang -std=c11 -Os -Wall -Wextra -Werror \
-    -arch arm64 \
+    -arch arm64 -arch x86_64 \
     -mmacosx-version-min=13.0 \
     "$ROOT/packaging/launcher.c" -o "$APP/Contents/MacOS/jev-jarvis"
 
@@ -214,8 +207,8 @@ check() {  # fail the build instead of shipping a broken bundle silently
 check "Info.plist 合法"            "plutil -lint '$APP/Contents/Info.plist'"
 check "启动器可执行"                "[ -x '$APP/Contents/MacOS/jev-jarvis' ]"
 check "启动器是原生 Mach-O"         "file '$APP/Contents/MacOS/jev-jarvis' | grep -q 'Mach-O'"
-check "启动器仅含 arm64 切片"        "lipo -archs '$APP/Contents/MacOS/jev-jarvis' | grep -qw arm64"
-check "Info.plist 声明仅 arm64"     "plutil -extract LSArchitecturePriority.0 raw '$APP/Contents/Info.plist' | grep -q arm64"
+check "启动器含 arm64 与 x86_64 切片" "lipo -verify_arch arm64 x86_64 '$APP/Contents/MacOS/jev-jarvis'"
+check "Info.plist 优先原生 arm64"     "plutil -extract LSArchitecturePriority.0 raw '$APP/Contents/Info.plist' | grep -q arm64"
 check "bootstrap 可执行"            "[ -x '$APP/Contents/Resources/launcher.zsh' ]"
 check "源码进包（hud.py）"          "[ -f '$APP/Contents/Resources/app/src/hud.py' ]"
 check "锁文件进包（uv.lock）"        "[ -f '$APP/Contents/Resources/app/uv.lock' ]"
@@ -226,16 +219,13 @@ check "通知文件进包（NOTICE）"       "[ -f '$APP/Contents/Resources/app/
 check "依赖版本已冻结到 $PY_PIN"     "grep -q '${PY_PIN}' '$APP/Contents/Resources/launcher.zsh'"
 check "运行时不会改写已签名包"       "grep -q '^export PYTHONDONTWRITEBYTECODE=1' '$APP/Contents/Resources/launcher.zsh'"
 check "没夹带缓存"                  "[ ! -d '$APP/Contents/Resources/app/src/__pycache__' ]"
-# a key that leaked into src/ would ship to whoever gets the bundle. src/builtin.py is the
-# single deliberate exception — it holds the shared default that lets an unconfigured install
-# produce candidates at all, which is why that token must be scope-limited and capped.
-# Every other file still has to be clean, so accidental leaks stay caught.
-if grep -rEl --binary-files=without-match --exclude=builtin.py 'sk-[A-Za-z0-9]{20,}' \
+# No bundled/shared API credentials are permitted in this API-only distribution.
+if grep -rEl --binary-files=without-match 'sk-[A-Za-z0-9]{20,}' \
         "$APP/Contents/Resources/app/src" "$APP/Contents/Resources/app/.env.example" 2>/dev/null | grep -q .; then
     echo "    ✗ 源码里疑似有 API key" >&2
     exit 1
 fi
-echo "    ✓ 没夹带 API key（builtin.py 的内置凭据是刻意保留的）"
+echo "    ✓ 没夹带 API key"
 
 echo "==> 完成"
 du -sh "$APP" | awk '{print "    包体积: " $1}'

@@ -141,7 +141,8 @@ def list_models(prefix: str, base: str, key: str) -> list[str]:
     return sorted(set(offered))
 
 
-def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | None = None) -> None:
+def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | None = None,
+                    *, structured: bool = False) -> None:
     """Use exactly the unsaved form values; never fall back to built-in credentials."""
     base = validate_endpoint(base)
     if not key or not model.strip():
@@ -167,6 +168,16 @@ def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | 
         # Testing must exercise the model the user selected, not an extra-body override.
         body.update(model=model, stream=False)
         headers["authorization"] = f"Bearer {key}"
+    if structured:
+        instruction = ('只返回 JSON 对象，意图只能是闲聊。格式：'
+                       '{"intent":"闲聊","confidence":0.9,"risk":0}。不要解释。')
+        body["messages"] = [{"role": "user", "content": '{"message":"你好"}'}]
+        body["temperature"] = 0
+        if api == "anthropic":
+            body["system"] = instruction
+        else:
+            body["messages"].insert(0, {"role": "system", "content": instruction})
+            body["response_format"] = {"type": "json_object"}
     data = http_post_json(_endpoint(base, api), headers, body, 30)
     if api == "anthropic":
         raw = "".join(p.get("text", "") for p in data.get("content", []) if isinstance(p, dict))
@@ -174,6 +185,9 @@ def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | 
         raw = Generator._openai_json(data, model, "非思考模型")
     if not raw.strip():
         raise ValueError("服务未返回文字；请检查模型是否支持生成，或关闭思考模式。")
+    if structured:
+        from judge_api import APIJudge
+        APIJudge.validate_judgment(json.loads(raw), "你好")
 
 
 def error_message(error: Exception) -> str:

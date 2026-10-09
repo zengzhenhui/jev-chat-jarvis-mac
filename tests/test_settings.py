@@ -154,6 +154,30 @@ class SettingsNetwork(unittest.TestCase):
         config.test_connection('TYPESAFE', self.base, 'key', 'model')
         self.assertEqual(Server.requests[-1][0], '/v1/systemone')
 
+    def test_structured_api_probe_uses_unsaved_credentials(self):
+        content = json.dumps({"intent": "闲聊", "confidence": .9, "risk": 0})
+        Server.response = {"choices": [{"message": {"content": content}}]}
+        with patch('generate.load_credentials', side_effect=AssertionError('no saved credentials')):
+            config.test_connection('OPENAI', self.base, 'draft-key', 'draft-model', structured=True)
+        _, headers, body = Server.requests[-1]
+        self.assertEqual(headers['authorization'], 'Bearer draft-key')
+        self.assertEqual(body['model'], 'draft-model')
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
+        self.assertEqual(body['messages'][0]['role'], 'system')
+
+    def test_structured_probe_rejects_text_and_invalid_scores(self):
+        for content in ('连接成功', '{"intent":"闲聊","confidence":9,"risk":0}'):
+            Server.response = {"choices": [{"message": {"content": content}}]}
+            with self.assertRaises(ValueError):
+                config.test_connection('OPENAI', self.base, 'key', 'model', structured=True)
+
+    def test_structured_anthropic_probe_validates_json(self):
+        Server.response = {'content': [{'text': '{"intent":"闲聊","confidence":0.9,"risk":0}'}]}
+        config.test_connection('ANTHROPIC', self.base, 'key', 'model', structured=True)
+        body = Server.requests[-1][2]
+        self.assertIn('system', body)
+        self.assertNotIn('response_format', body)
+
     def test_empty_and_thinking_are_not_success(self):
         for response in ({}, {'choices': [{'message': {'content': '', 'reasoning_content': 'thinking'}}]}):
             Server.response = response

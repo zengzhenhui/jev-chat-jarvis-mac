@@ -1060,7 +1060,8 @@ class HudController(NSObject):
                     it = items[row]
                     wanted.add((slot, row))
                     r = self._rows[slot][row]
-                    prob = "排序中" if it["prob"] is None else f"{it['prob'] * 100:.0f}%"
+                    prob = ("不可用" if it.get("unavailable") else "排序中" if it["prob"] is None
+                            else f"{it['prob'] * 100:.0f}" + ("分" if it.get("estimated") else "%"))
                     self._set_probability_label(r["prob"], row, prob)
                     r["text"].setStringValue_(it["text"])
                     self._set_progress(slot, row, it["prob"])
@@ -1269,10 +1270,11 @@ class HudController(NSObject):
         """Score and reorder each group's candidates. One ranking pass covers every
         candidate the requests produced, so `#1`/`#2` inside a group means "the better of
         these two", not "whichever line the model wrote first" — one forward pass, not one
-        per tone. Ranking failure leaves probabilities at 0 rather than dropping rows.
+        per tone. Ranking failure leaves scores unavailable rather than inventing zero.
         """
         texts = [it["text"] for _s, _t, items in payload for it in items]
         scores: dict[str, float] = {}
+        estimated = False
         if intent and texts:
             try:
                 with self._model_lock:   # never two local forwards at once
@@ -1282,13 +1284,15 @@ class HudController(NSObject):
                     ranked = self.judge.rank_candidates(
                         chat_context.model_message(message, context), intent, texts, context=context)
                 scores = {r["text"]: r["prob"] for r in ranked}
+                estimated = any(r.get("estimated") for r in ranked)
             except Exception:
                 scores = {}
         out = []
         for slot, tone, items in payload:
-            scored = [{"text": it["text"], "prob": scores.get(it["text"], 0.0)}
+            scored = [{"text": it["text"], "prob": scores.get(it["text"]),
+                       "estimated": estimated, "unavailable": it["text"] not in scores}
                       for it in items]
-            scored.sort(key=lambda x: -x["prob"])
+            scored.sort(key=lambda x: -(x["prob"] if x["prob"] is not None else -1))
             out.append((slot, tone, scored))
         return out
 
@@ -1383,7 +1387,10 @@ class HudController(NSObject):
 
     @objc.python_method
     def _cand_header(self, payload) -> str:
-        pending = any(it["prob"] is None for _s, _t, items in payload for it in items)
+        if any(it.get("unavailable") for _s, _t, items in payload for it in items):
+            return "候选回复 · 排序不可用"
+        pending = any(it["prob"] is None and not it.get("unavailable")
+                      for _s, _t, items in payload for it in items)
         return "候选回复 · 排序中…" if pending else "候选回复（按合适度排序）"
 
     def applyTones_(self, payload):
@@ -2370,7 +2377,7 @@ class HudController(NSObject):
         if intent:
             self._push("applyCandidates:", payload)
         t_rank = time.perf_counter()
-        ranked = self._rank_payload(payload, newest.text, intent) if intent else payload
+        ranked = self._rank_payload(payload, newest.text, intent)
         rank_ms = (time.perf_counter() - t_rank) * 1000
         if intent:
             backend = getattr(self.judge, "backend_label", "本地 decider-2b，一次前向")
@@ -2481,7 +2488,8 @@ class HudController(NSObject):
             self._render("status", "分析完成", PALETTE["muted"])
         self._render("intent", v["intent"], PALETTE["text"])
         # the intent recognition rate, read off the judged intent — same muted slot
-        self._render("confidence", f"意图识别率 {v['confidence']:.0%}", PALETTE["muted"])
+        self._render("confidence", ("模型估计 " if v.get("estimated") else "意图识别率 ")
+                     + f"{v['confidence']:.0%}", PALETTE["muted"])
         # Rounded, so the panel does not claim a precision it has: the judge reports a
         # mean like 4.7 out of a 10-level distribution, and "4.7/9" reads as a measurement
         # while "5/9" reads as the estimate it is. Deliberately the mean and not the most
@@ -2697,7 +2705,7 @@ class HudController(NSObject):
         # memory pressure — both used to look identical from outside: a silent panel.
         # The "loading" line says what the wait is; applyWarmDone_ clears it only if
         # nothing more urgent has replaced it in the meantime.
-        local_judge = not userconfig.get("TYPESAFE_API_KEY")
+        local_judge = not userconfig.get("TYPESAFE_API_KEY") and getattr(self.judge, "name", "") not in ("chat-api", "paused")
         if local_judge:
             self._push("applyStatus:", WARM_STATUS)
         if (local_judge
@@ -2731,6 +2739,10 @@ class HudController(NSObject):
     @objc.python_method
     def _onboarding_needed(self) -> bool:
         """The #38 dialog fires exactly once: no key, nothing cached, no recorded choice."""
+        if userconfig.get("JUDGE_BACKEND").strip().lower() == "skip":
+            return False
+        if judge.runtime_mode.api_only():
+            return not load_credentials()[1]
         return (not userconfig.get("TYPESAFE_API_KEY")
                 and not judge.model_cached()
                 and not userconfig.get("JUDGE_BACKEND"))
@@ -2743,6 +2755,9 @@ class HudController(NSObject):
         real environment, which is how the pick takes effect without a restart.
         """
         if not self._onboarding_needed():
+            return
+        if judge.runtime_mode.api_only():
+            self.openSettings_(None)
             return
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_("选择判断方式")
@@ -2828,7 +2843,7 @@ def warn_if_no_generation_key() -> None:
     loop, i.e. an app that looks hung. osascript's dialog belongs to a process that can
     activate, and Popen does not wait, so a dialog nobody dismisses cannot stall us.
     """
-    if load_credentials()[1]:
+    if load_credentials()[1] or judge.runtime_mode.api_only():
         return
     path = str(userconfig.ENV_FILE).replace(str(Path.home()), "~")
     # AppleScript string escapes (\n) work inside the literal; keep it free of double quotes
@@ -2877,7 +2892,7 @@ def main() -> None:  # pragma: no cover — GUI 启动粘合，只有真启动�
     # always need it, and it proves the log is live before the first message arrives.
     _base, _key, _model, _src, _api = load_credentials()
     _log(f"启动 · 判断层 "
-         f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY') else '本地 decider-2b'}"
+         f"{getattr(controller.judge, 'backend_label', '本地 decider-2b')}"
          f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
          + ("（内置默认）" if _src == BUILTIN_SOURCE else "")
          + (" · YOLO 框开" if controller._show_boxes else ""))

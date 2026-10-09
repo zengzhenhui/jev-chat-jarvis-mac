@@ -1,5 +1,6 @@
 """Download/status regressions without network, credentials or model weights."""
 import ast
+import importlib.util
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from judge import Judge, FallbackJudge, _download_progress
 
 
 class DownloadTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_resume_and_completion(self):
         reports = []
         bar = _download_progress(reports.append, min_interval=0)(unit='B', total=4_000_000_000,
@@ -30,6 +32,7 @@ class DownloadTests(unittest.TestCase):
         bar.close()
         self.assertEqual(len(reports), count)
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_report_throttled_to_min_interval(self):
         # Per-chunk update() storms held the GIL away from the Cocoa main thread
         # (probe: beachball + hang at 63%). Intermediate reports are droppable.
@@ -75,6 +78,7 @@ class DownloadTests(unittest.TestCase):
             self.assertIn('25% · 1.0/4.0 GB', reports[-1])
             self.assertNotIn('已接收', reports[-1])
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_file_count_and_quiet_terminal(self):
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
         reports = []
@@ -90,6 +94,7 @@ class DownloadTests(unittest.TestCase):
         finally:
             enable_progress_bars()
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_snapshot_total_updated_after_creation(self):
         reports = []
         with _download_progress(reports.append, min_interval=0)(unit='B', total=0) as bar:
@@ -115,6 +120,7 @@ class DownloadTests(unittest.TestCase):
         return SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=Mock(return_value=tok)),
                                AutoModelForCausalLM=SimpleNamespace(from_pretrained=loader))
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_cache_hit_has_no_download_and_loads_once(self):
         j = self.local()
         observed = []
@@ -132,6 +138,7 @@ class DownloadTests(unittest.TestCase):
         self.assertIsNone(j.load_status)
         self.assertTrue(j._loaded)
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_failure_clears_progress_and_preserves_exception(self):
         j = self.local()
         def fail(*args, **kwargs):

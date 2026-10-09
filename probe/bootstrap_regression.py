@@ -96,7 +96,11 @@ case "$1" in
         mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
         cp "$FIXTURE_ROOT/python" "$UV_PROJECT_ENVIRONMENT/bin/python"
         chmod +x "$UV_PROJECT_ENVIRONMENT/bin/python" ;;
-    run) echo app-started >> "$TRACE" ;;
+    run)
+        case "$*" in
+            *backend_mode.py*) echo "${FIXTURE_BACKEND:-api}" ;;
+            *) echo app-started >> "$TRACE" ;;
+        esac ;;
 esac
 '''
 
