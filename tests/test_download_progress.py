@@ -1,5 +1,6 @@
 """Download/status regressions without network, credentials or model weights."""
 import ast
+import importlib.util
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from judge import Judge, FallbackJudge, _download_progress
 
 
 class DownloadTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_resume_and_completion(self):
         reports = []
         bar = _download_progress(reports.append, min_interval=0)(unit='B', total=4_000_000_000,
@@ -30,6 +32,7 @@ class DownloadTests(unittest.TestCase):
         bar.close()
         self.assertEqual(len(reports), count)
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_report_throttled_to_min_interval(self):
         # Per-chunk update() storms held the GIL away from the Cocoa main thread
         # (probe: beachball + hang at 63%). Intermediate reports are droppable.
@@ -75,6 +78,7 @@ class DownloadTests(unittest.TestCase):
             self.assertIn('25% · 1.0/4.0 GB', reports[-1])
             self.assertNotIn('已接收', reports[-1])
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_file_count_and_quiet_terminal(self):
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
         reports = []
@@ -90,6 +94,7 @@ class DownloadTests(unittest.TestCase):
         finally:
             enable_progress_bars()
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_snapshot_total_updated_after_creation(self):
         reports = []
         with _download_progress(reports.append, min_interval=0)(unit='B', total=0) as bar:
@@ -115,6 +120,7 @@ class DownloadTests(unittest.TestCase):
         return SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=Mock(return_value=tok)),
                                AutoModelForCausalLM=SimpleNamespace(from_pretrained=loader))
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_cache_hit_has_no_download_and_loads_once(self):
         j = self.local()
         observed = []
@@ -124,7 +130,8 @@ class DownloadTests(unittest.TestCase):
         loader = Mock(side_effect=cached)
         with patch.dict(sys.modules, transformers=self.fake_transformers(loader)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)):
             j._load()
             j._load()
         self.assertEqual(loader.call_count, 1)
@@ -132,6 +139,7 @@ class DownloadTests(unittest.TestCase):
         self.assertIsNone(j.load_status)
         self.assertTrue(j._loaded)
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "optional local-model dependency not installed")
     def test_failure_clears_progress_and_preserves_exception(self):
         j = self.local()
         def fail(*args, **kwargs):
@@ -141,7 +149,8 @@ class DownloadTests(unittest.TestCase):
                 raise OSError('disk full')
         with patch.dict(sys.modules, transformers=self.fake_transformers(fail)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 j._load()
         self.assertIsNone(j.load_status)
@@ -150,31 +159,52 @@ class DownloadTests(unittest.TestCase):
     def test_warm_and_load_still_share_one_lock(self):
         j = self.local()
         entered, release, other_done = threading.Event(), threading.Event(), threading.Event()
-        states = []
+        other_started = threading.Event()
+        states, errors = [], []
+
         def forward(_):
             states.append(j.load_status)
             entered.set()
             release.wait(3)
+
+        def other():
+            other_started.set()
+            with j._load_lock:
+                j._load()
+            other_done.set()
+
+        def checked(target):
+            # A background exception must fail the test, not just print a traceback.
+            try:
+                target()
+            except BaseException as exc:
+                errors.append(exc)
+
         j.judge = forward
         loader = Mock(return_value=Mock())
+        # This is a locking test, independent of the optional download UI and network.
         with patch.dict(sys.modules, transformers=self.fake_transformers(loader)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
-            warm = threading.Thread(target=j.warm)
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)), \
+                patch('judge._download_progress', return_value=Mock()) as progress:
+            warm = threading.Thread(target=checked, args=(j.warm,), daemon=True)
+            thread = threading.Thread(target=checked, args=(other,), daemon=True)
             warm.start()
-            self.assertTrue(entered.wait(3))
-            def other():
-                with j._load_lock:
-                    j._load()
-                other_done.set()
-            thread = threading.Thread(target=other)
-            thread.start()
             try:
+                self.assertTrue(entered.wait(3), f"warm-up never reached forward: {errors!r}")
+                thread.start()
+                self.assertTrue(other_started.wait(3))
                 self.assertFalse(other_done.wait(.05))
             finally:
                 release.set()
                 warm.join(3)
-                thread.join(3)
+                if thread.ident is not None:
+                    thread.join(3)
+            self.assertFalse(warm.is_alive())
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            progress.assert_called_once()
         self.assertTrue(other_done.is_set())
         self.assertEqual(loader.call_count, 1)
         self.assertEqual(states, ['预热判断模型…'])

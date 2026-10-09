@@ -102,8 +102,9 @@ class ContextRequests(unittest.TestCase):
         fallback.local.judge.return_value = {'intent': '闲聊'}
         fallback.fell_back = False
         fallback.reason = ''
-        result = fallback.judge('当前', context)
-        fallback.rank_candidates('当前', '闲聊', ['候选'], context)
+        with patch('runtime_mode.api_only', return_value=False):
+            result = fallback.judge('当前', context)
+            fallback.rank_candidates('当前', '闲聊', ['候选'], context)
         fallback.local.judge.assert_called_once_with('当前', context)
         fallback.local.rank_candidates.assert_called_once_with('当前', '闲聊', ['候选'], context)
         self.assertNotIn('私密错误正文', str(result))

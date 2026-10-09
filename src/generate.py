@@ -1,8 +1,8 @@
 """Candidate reply generation via a fast Chinese LLM API.
 
 Why an API instead of a local model: a 3B local model costs ~6 GB of disk, ~2-3 s per
-generation on MPS and writes noticeably worse Chinese than the hosted fast tier. The
-judgment half stays local (decider-2b, ~0.5 s, no network) — only reply writing goes out.
+generation on MPS and writes noticeably worse Chinese than the hosted fast tier. API-only installs also use the configured provider for judgment and ranking.
+Optional ARM local inference is selected separately.
 
 Two API shapes are supported, because providers disagree:
     openai     POST {base}/v1/chat/completions   Authorization: Bearer   -> choices[0].message.content
@@ -14,8 +14,8 @@ the shape; built-in credentials infer it from the base URL.
 Nothing is ever written back, and the key is never logged. Run
 `uv run python src/generate.py --check` to see which source is in use (key masked).
 
-Privacy: the boss's message text is sent to the provider. That is the one place this app
-leaves the machine — swap in a local model if that matters more than reply quality.
+Privacy: message text and selected context are sent to the configured provider.
+API-only judgment and ranking also transmit this data; no shared relay is enabled.
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ DEFAULT_MODEL = "glm-4-flash"
 DEFAULT_BASE = "https://open.bigmodel.cn/api/anthropic"
 DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
-MISSING_HINT = ("未配置生成层 Key：候选回复需要它，判断/风险不需要。"
-                "设置 OPENAI_API_KEY（或 ANTHROPIC_API_KEY）后重启，见 README 配置章节。")
+MISSING_HINT = ("未配置 API Key：请在模型设置填写 OpenAI 或 Anthropic 兼容服务的密钥、地址和模型，"
+                "保存后重启。API 模式的判断、风险与候选都需要在线服务。")
 # 用的是随包分发的凭据时报这个来源名，日志/--check 里能一眼分清「内置」和「你自己配的」
 BUILTIN_SOURCE = "内置默认"
 
@@ -132,6 +132,13 @@ class ThinkingOnlyError(Exception):
     error names the model and the fix — the panel would otherwise fold it into 「空结果」,
     which reads as "generation is broken" instead of "the model is misconfigured".
     """
+
+
+class OutputLimitError(Exception):
+    """The provider reports its output limit was reached before any reply text."""
+
+
+OUTPUT_LIMIT_HINT = "输出达到长度上限但没有正文，请关闭思考模式或检查模型设置"
 
 
 # The message carried by ThinkingOnlyError. Fits the panel's err[:60] display budget for
@@ -396,7 +403,8 @@ class Generator:
             self._creds = (base, key, self.model_override or model)
         return self._creds
 
-    def _call(self, prompt: str, on_delta=None) -> str:
+    def _call(self, prompt: str, on_delta=None, *, system: str | None = None,
+              json_mode: bool = False) -> str:
         """One completion. With `on_delta`, streams: each content fragment is passed to it
         as it arrives, and the full text is still returned at the end (so the caller can
         parse lines once, authoritatively, from the same string).
@@ -408,6 +416,8 @@ class Generator:
         the old way — streaming degrades, it does not fail.
         """
         base, key, model, _src, api = load_credentials()
+        if not key:
+            raise RuntimeError(MISSING_HINT)
         # the constructor's overrides win — without this the `model` argument was accepted
         # and silently ignored, so the request went out with whatever the config named
         if self.model_override:
@@ -422,6 +432,10 @@ class Generator:
             url = _endpoint(base, "anthropic")
             body = {"model": model, "max_tokens": 300, "temperature": 0.9,
                     "messages": [{"role": "user", "content": prompt}]}
+            if json_mode:
+                body["temperature"] = 0
+            if system:
+                body["system"] = system
             headers = {"content-type": "application/json", "x-api-key": key,
                        "anthropic-version": "2023-06-01"}
             data = self._post(url, headers, body)
@@ -434,12 +448,22 @@ class Generator:
                                    if isinstance(p, dict))
                 if thinking.strip():
                     raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+                if data.get("stop_reason") == "max_tokens":
+                    raise OutputLimitError(OUTPUT_LIMIT_HINT)
             return raw
 
         url = _endpoint(base, "openai")
         body = {"model": model, "max_tokens": 300, "temperature": 0.9,
                 "messages": [{"role": "user", "content": prompt}]}
         body.update(_extra_params())
+        body["model"] = model  # selected model wins, exactly as in the settings probe
+        if system:
+            body["messages"] = [{"role": "system", "content": system},
+                                {"role": "user", "content": prompt}]
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+            body["temperature"] = 0
+            body["stream"] = False
         headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
         if on_delta is not None:
             return self._stream_openai(url, headers, body, model, alt, on_delta)
@@ -461,6 +485,8 @@ class Generator:
                 v = msg.get(field)
                 if isinstance(v, str) and v.strip():
                     raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+            if choices[0].get("finish_reason") == "length":
+                raise OutputLimitError(OUTPUT_LIMIT_HINT)
         return content
 
     def _stream_openai(self, url: str, headers: dict, body: dict,
@@ -478,6 +504,7 @@ class Generator:
             url, data=json.dumps({**body, "stream": True}).encode(), headers=headers)
         content: list[str] = []
         reasoning: list[str] = []
+        output_limited = False
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             ctype = (r.headers.get("content-type") or "").lower()
             if "event-stream" not in ctype:
@@ -496,6 +523,7 @@ class Generator:
                 except ValueError:
                     continue        # a malformed keepalive must not kill the stream
                 for ch in evt.get("choices") or []:
+                    output_limited = output_limited or ch.get("finish_reason") == "length"
                     delta = ch.get("delta") or {}
                     frag = delta.get("content") or ""
                     if frag:
@@ -508,6 +536,8 @@ class Generator:
         raw = "".join(content)
         if not raw.strip() and "".join(reasoning).strip():
             raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+        if not raw.strip() and output_limited:
+            raise OutputLimitError(OUTPUT_LIMIT_HINT)
         return raw
 
     def _post(self, url: str, headers: dict, body: dict) -> dict:
@@ -562,8 +592,10 @@ class Generator:
 
         try:
             raw = self._call(prompt, on_delta if on_line is not None else None)
-        except ThinkingOnlyError as e:
+        except ThinkingOnlyError:
             return [], "模型仅返回思考内容，请关闭思考模式或更换模型"
+        except OutputLimitError:
+            return [], OUTPUT_LIMIT_HINT
         except urllib.error.HTTPError as e:
             return [], f"HTTP {e.code}：请检查模型服务设置"
         except Exception as e:
@@ -621,7 +653,9 @@ class Generator:
                 try:
                     texts, err = futures[i].result()
                 except Exception as e:      # defensive: _one_tone swallows its own errors
-                    texts, err = [], f"{type(e).__name__}: {e}"
+                    # The HUD displays this error. Remote exception messages can
+                    # contain URLs, credentials, or chat text; keep only the class.
+                    texts, err = [], type(e).__name__
                 groups.append({"slot": i, "tone": tone, "texts": texts, "error": err})
 
         _base, _key, model = self._creds_or_load()

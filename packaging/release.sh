@@ -98,6 +98,7 @@ check() {
 check "解压得到 jev-jarvis.app"      "[ -d '$TMP/jev-jarvis.app' ]"
 check "启动器带可执行权限"            "[ -x '$TMP/jev-jarvis.app/Contents/MacOS/jev-jarvis' ]"
 check "启动器是原生 Mach-O"           "file '$TMP/jev-jarvis.app/Contents/MacOS/jev-jarvis' | grep -q 'Mach-O'"
+check "启动器含 arm64 与 x86_64"     "lipo -verify_arch arm64 x86_64 '$TMP/jev-jarvis.app/Contents/MacOS/jev-jarvis'"
 check "bootstrap 带可执行权限"        "[ -x '$TMP/jev-jarvis.app/Contents/Resources/launcher.zsh' ]"
 check "Info.plist 合法"             "plutil -lint '$TMP/jev-jarvis.app/Contents/Info.plist'"
 check "图标在"                      "[ -f '$TMP/jev-jarvis.app/Contents/Resources/AppIcon.icns' ]"
@@ -129,7 +130,7 @@ if [ "$PUBLISH" = 1 ]; then
         echo "**第一次打开**：右键（或按住 Control 点）→ 打开 → 再点「打开」。未做 Apple 公证，双击会被 Gatekeeper 拦，只需这一次。"
         echo "若弹「**已损坏，无法打开**」（浏览器下载常见，右键无效）：终端执行 \`sudo xattr -r -d com.apple.quarantine /Applications/jev-jarvis.app\` 后再打开。"
         echo "**第一次启动**：联网装依赖（uv 缓存命中就很快）；只需给 \`jev-jarvis\` 授予「屏幕录制」权限，然后退出重开，无需单独授权 \`python3.12\`。"
-        echo "**判断层默认跑本地模型，首次要下载约 3.8 GB**（之后离线可用）。不想下载：在 \`~/.config/jev-jarvis/env\` 里给判断层配一个 key 走云端，见 README「配置」。"
+        echo "**默认 API 模式**：支持 Intel 与 Apple Silicon，需配置自己的模型服务与 API key；不附带共享密钥，不下载本地模型。Apple Silicon 可明确选择本地模式，见 README。"
         echo
         echo "### 本次包含"
         if git -C "$ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then

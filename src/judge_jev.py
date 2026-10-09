@@ -26,6 +26,7 @@ Config uses TypeSafe's own conventional names (src/userconfig.py):
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
@@ -37,6 +38,13 @@ from judge import ACTION_MAP, INTENTS, RISK_LEVELS
 DEFAULT_BASE = "https://api.typesafe.ai"
 DEFAULT_MODEL = "jev-latest"
 TIMEOUT = 30
+
+
+def _score(value, maximum: float) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0 <= value <= maximum):
+        raise ValueError("Jev 返回的分数缺失或超出范围。")
+    return float(value)
 
 
 def jev_configured() -> bool:
@@ -76,18 +84,11 @@ class JevJudge:
         intent_ans = answers.get("intent") or {}
         risk_ans = answers.get("risk") or {}
 
-        intent = intent_ans.get("choice") or "闲聊"
-        if intent not in INTENTS:
-            # gateways occasionally echo the index or a near-miss label
-            for name in INTENTS:
-                if name in str(intent):
-                    intent = name
-                    break
-            else:
-                intent = "闲聊"
-        confidence = float(intent_ans.get("confidence") or 0.0)
-        risk = risk_ans.get("score")
-        risk = float(risk) if isinstance(risk, (int, float)) else 0.0
+        intent = intent_ans.get("choice")
+        if not isinstance(intent, str) or intent not in INTENTS:
+            raise ValueError("Jev 未返回有效意图。")
+        confidence = _score(intent_ans.get("confidence"), 1)
+        risk = _score(risk_ans.get("score"), 9)
 
         return {
             "intent": intent,
@@ -115,12 +116,18 @@ class JevJudge:
         data = self._post(payload)
         ans = ((data.get("answers") or {}).get("best") or {})
         probs = ans.get("probabilities") or {}
+        if not isinstance(probs, dict):
+            raise ValueError("Jev 排序概率格式无效。")
+        if not all(c in probs for c in candidates):
+            if ans.get("choice") not in candidates:
+                raise ValueError("Jev 未返回有效排序。")
+            _score(ans.get("confidence"), 1)
         ranked = []
         for c in candidates:
             p = probs.get(c)
             if p is None:                      # gateway may echo the chosen label only
                 p = ans.get("confidence", 0.0) if ans.get("choice") == c else 0.0
-            ranked.append({"text": c, "prob": float(p)})
+            ranked.append({"text": c, "prob": _score(p, 1)})
         ranked.sort(key=lambda r: -r["prob"])
         return ranked
 

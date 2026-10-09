@@ -1,5 +1,8 @@
 # 常见问题解答（FAQ）
 
+> Intel / API-only 适配：默认基础安装不安装或下载本地模型，需配置自己的 API。Intel 与 Apple Silicon 支持目标为 macOS 13+；可选本地模型需要原生 Apple Silicon 与 macOS 14+。无内置共享密钥或作者中转。安装和实机验收边界见 [Intel 安装指南](intel-api.md)。
+
+
 路径与常见报错的速查。完整配置说明见 README[「配置」](../README.md#配置)，磁盘清理见[「磁盘占用与清理」](../README.md#磁盘占用与清理)。
 
 ## 配置文件在哪？
