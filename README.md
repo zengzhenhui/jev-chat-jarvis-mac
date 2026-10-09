@@ -146,7 +146,7 @@ chmod 600 ~/.config/jev-jarvis/env
 - **判断层网关**：`TYPESAFE_BASE_URL` 三种填法等价可用——只到主机（`https://api.typesafe.ai`）、带版本段（`…/v1`，自动补动作段，不会出现 `/v1/v1/…`）、或填完整动作路径（填到动作段为止，原样使用、不再拼接）。第三方 TypeSafe 兼容网关填网关地址 + 网关 key，模型名按网关填写（如 Vercel AI Gateway 填 `https://ai-gateway.vercel.sh/v1/evaluate`、模型 `typesafe-ai/jev`；OpenRouter 填 `https://openrouter.ai/api/alpha/decisions`、模型 `typesafe/jev-1.13`，key 用 OpenRouter 的 `sk-or-…`，响应同为 systemone 形状）
 - **判断方式选择（`JUDGE_BACKEND`）**：`api` 强制 API-only；默认基础安装也走 API，不下载或加载本地模型。Intel 即使有旧缓存也不能使用本地模式。Apple Silicon 要保留本地判断，请在用户 env 设置 `JUDGE_BACKEND=local`，启动器会安装 `local` extra；源码命令也可用 `uv run --extra local python src/hud.py`。`cloud` 同样为 API-only（配置 TypeSafe 时优先，否则使用生成 API），`skip` 暂不判断。API 模式云端失败会报错，不偷偷回退本地。
 - **国内网络加速**：模型已缓存后启动**完全不联网**（直接从本地快照加载，不查新版本）；首次下载时若 huggingface.co 不可达（探测 2.5 秒），自动改用镜像 `hf-mirror.com` 下载并在日志注明。也可在 env 里 `export HF_ENDPOINT="https://hf-mirror.com"` 显式指定任意兼容端点——显式配置优先，不再探测
-- **别用 thinking 模型**：思考吃光 `max_tokens`，候选 0 条，面板只报「候选生成失败」——DeepSeek 认准 `deepseek-chat`
+- **思考模式与输出额度**：应用默认每次请求的 `max_tokens` 为 300；开启思考时可能在生成正文前耗尽额度。候选失败会显示脱敏后的 HTTP 状态、仅思考或无正文且达到长度上限等原因；普通空响应仍提示检查模型设置。不展示服务原始报错、密钥、聊天正文或思考内容，也不自动提高额度或更换模型。按服务商说明，通过 `OPENAI_EXTRA_BODY` 关闭思考模式，修改后重启。
 - **自定义话术**：env 加一行 `JEV_TONES`（`|` 分隔、每条「名字=说明」，同名覆盖内置，重启生效），如 `摸鱼大师=像资深摸鱼选手，把活推得漂亮又不失礼`。**有质量门槛**：说明至少 10 字，写清「什么语气 + 别变成什么」；太短的（如「夸我」）不会加载，启动日志会写明原因——说明太空模型就没得发挥，候选只会平庸
 - 自查凭据（不打印完整 key）：`uv run python src/generate.py --check`、`uv run python src/judge_jev.py`
 

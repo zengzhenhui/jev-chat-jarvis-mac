@@ -134,6 +134,13 @@ class ThinkingOnlyError(Exception):
     """
 
 
+class OutputLimitError(Exception):
+    """The provider reports its output limit was reached before any reply text."""
+
+
+OUTPUT_LIMIT_HINT = "输出达到长度上限但没有正文，请关闭思考模式或检查模型设置"
+
+
 # The message carried by ThinkingOnlyError. Fits the panel's err[:60] display budget for
 # realistic model names (fixed part is 41 chars), so the suggestion survives truncation.
 # {alt} is a non-thinking model the configured endpoint actually serves (see _call).
@@ -441,6 +448,8 @@ class Generator:
                                    if isinstance(p, dict))
                 if thinking.strip():
                     raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+                if data.get("stop_reason") == "max_tokens":
+                    raise OutputLimitError(OUTPUT_LIMIT_HINT)
             return raw
 
         url = _endpoint(base, "openai")
@@ -476,6 +485,8 @@ class Generator:
                 v = msg.get(field)
                 if isinstance(v, str) and v.strip():
                     raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+            if choices[0].get("finish_reason") == "length":
+                raise OutputLimitError(OUTPUT_LIMIT_HINT)
         return content
 
     def _stream_openai(self, url: str, headers: dict, body: dict,
@@ -493,6 +504,7 @@ class Generator:
             url, data=json.dumps({**body, "stream": True}).encode(), headers=headers)
         content: list[str] = []
         reasoning: list[str] = []
+        output_limited = False
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             ctype = (r.headers.get("content-type") or "").lower()
             if "event-stream" not in ctype:
@@ -511,6 +523,7 @@ class Generator:
                 except ValueError:
                     continue        # a malformed keepalive must not kill the stream
                 for ch in evt.get("choices") or []:
+                    output_limited = output_limited or ch.get("finish_reason") == "length"
                     delta = ch.get("delta") or {}
                     frag = delta.get("content") or ""
                     if frag:
@@ -523,6 +536,8 @@ class Generator:
         raw = "".join(content)
         if not raw.strip() and "".join(reasoning).strip():
             raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model, alt=alt))
+        if not raw.strip() and output_limited:
+            raise OutputLimitError(OUTPUT_LIMIT_HINT)
         return raw
 
     def _post(self, url: str, headers: dict, body: dict) -> dict:
@@ -577,8 +592,10 @@ class Generator:
 
         try:
             raw = self._call(prompt, on_delta if on_line is not None else None)
-        except ThinkingOnlyError as e:
+        except ThinkingOnlyError:
             return [], "模型仅返回思考内容，请关闭思考模式或更换模型"
+        except OutputLimitError:
+            return [], OUTPUT_LIMIT_HINT
         except urllib.error.HTTPError as e:
             return [], f"HTTP {e.code}：请检查模型服务设置"
         except Exception as e:
@@ -636,7 +653,9 @@ class Generator:
                 try:
                     texts, err = futures[i].result()
                 except Exception as e:      # defensive: _one_tone swallows its own errors
-                    texts, err = [], f"{type(e).__name__}: {e}"
+                    # The HUD displays this error. Remote exception messages can
+                    # contain URLs, credentials, or chat text; keep only the class.
+                    texts, err = [], type(e).__name__
                 groups.append({"slot": i, "tone": tone, "texts": texts, "error": err})
 
         _base, _key, model = self._creds_or_load()

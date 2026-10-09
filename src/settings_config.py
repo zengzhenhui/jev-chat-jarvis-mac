@@ -15,7 +15,8 @@ import urllib.parse
 
 import userconfig
 from chat_context import message_limit
-from generate import _endpoint, base_is_verbatim_action, http_post_json, jev_request_url, Generator, ThinkingOnlyError
+from generate import (_endpoint, base_is_verbatim_action, http_post_json, jev_request_url,
+                      Generator, ThinkingOnlyError, OutputLimitError, OUTPUT_LIMIT_HINT)
 import styles
 
 PREFIXES = ("TYPESAFE", "OPENAI", "ANTHROPIC")
@@ -201,6 +202,8 @@ def error_message(error: Exception) -> str:
         return f"HTTP {error.code}：请检查地址、密钥及模型权限。"
     if isinstance(error, ThinkingOnlyError):
         return "模型只返回了思考内容，没有正文；请关闭思考模式或更换模型。"
+    if isinstance(error, OutputLimitError):
+        return OUTPUT_LIMIT_HINT
     reason = getattr(error, "reason", error)
     if isinstance(reason, socket.gaierror):
         return "域名解析失败：请检查服务地址拼写与本机 DNS（换 114.114.114.114 等公共 DNS 可辅助判断）。"
