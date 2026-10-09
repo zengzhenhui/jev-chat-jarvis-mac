@@ -130,7 +130,8 @@ class DownloadTests(unittest.TestCase):
         loader = Mock(side_effect=cached)
         with patch.dict(sys.modules, transformers=self.fake_transformers(loader)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)):
             j._load()
             j._load()
         self.assertEqual(loader.call_count, 1)
@@ -148,7 +149,8 @@ class DownloadTests(unittest.TestCase):
                 raise OSError('disk full')
         with patch.dict(sys.modules, transformers=self.fake_transformers(fail)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 j._load()
         self.assertIsNone(j.load_status)
@@ -157,31 +159,52 @@ class DownloadTests(unittest.TestCase):
     def test_warm_and_load_still_share_one_lock(self):
         j = self.local()
         entered, release, other_done = threading.Event(), threading.Event(), threading.Event()
-        states = []
+        other_started = threading.Event()
+        states, errors = [], []
+
         def forward(_):
             states.append(j.load_status)
             entered.set()
             release.wait(3)
+
+        def other():
+            other_started.set()
+            with j._load_lock:
+                j._load()
+            other_done.set()
+
+        def checked(target):
+            # A background exception must fail the test, not just print a traceback.
+            try:
+                target()
+            except BaseException as exc:
+                errors.append(exc)
+
         j.judge = forward
         loader = Mock(return_value=Mock())
+        # This is a locking test, independent of the optional download UI and network.
         with patch.dict(sys.modules, transformers=self.fake_transformers(loader)), \
                 patch('judge.low_memory_reason', return_value=None), \
-                patch('judge.download_block_reason', return_value=None):
-            warm = threading.Thread(target=j.warm)
+                patch('judge.download_block_reason', return_value=None), \
+                patch('judge.resolve_load_source', return_value=('/fake/snapshot', True)), \
+                patch('judge._download_progress', return_value=Mock()) as progress:
+            warm = threading.Thread(target=checked, args=(j.warm,), daemon=True)
+            thread = threading.Thread(target=checked, args=(other,), daemon=True)
             warm.start()
-            self.assertTrue(entered.wait(3))
-            def other():
-                with j._load_lock:
-                    j._load()
-                other_done.set()
-            thread = threading.Thread(target=other)
-            thread.start()
             try:
+                self.assertTrue(entered.wait(3), f"warm-up never reached forward: {errors!r}")
+                thread.start()
+                self.assertTrue(other_started.wait(3))
                 self.assertFalse(other_done.wait(.05))
             finally:
                 release.set()
                 warm.join(3)
-                thread.join(3)
+                if thread.ident is not None:
+                    thread.join(3)
+            self.assertFalse(warm.is_alive())
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            progress.assert_called_once()
         self.assertTrue(other_done.is_set())
         self.assertEqual(loader.call_count, 1)
         self.assertEqual(states, ['预热判断模型…'])

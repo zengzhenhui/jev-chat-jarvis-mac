@@ -26,8 +26,10 @@ class ModelCacheTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        self.addCleanup(os.environ.pop, "HF_HOME", None)
-        os.environ["HF_HOME"] = str(root)
+        env = mock.patch.dict(os.environ, {"HF_HOME": str(root),
+                                          "HF_HUB_CACHE": str(root / "hub")})
+        env.start()
+        self.addCleanup(env.stop)
         self.root = root
 
     def test_cached_true_when_snapshot_has_weights(self):
@@ -87,7 +89,9 @@ class EndpointFallbackTests(unittest.TestCase):
     """#95: the mirror decision — explicit config wins, unreachable default falls back."""
 
     def setUp(self):
-        self.addCleanup(os.environ.pop, "HF_ENDPOINT", None)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
         os.environ.pop("HF_ENDPOINT", None)
 
     def test_explicit_endpoint_wins_untouched(self):
@@ -140,13 +144,23 @@ class DownloadGateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        self.addCleanup(os.environ.pop, "HF_HOME", None)
-        os.environ["HF_HOME"] = str(root)
+        env = mock.patch.dict(os.environ, {"HF_HOME": str(root),
+                                          "HF_HUB_CACHE": str(root / "hub")})
+        env.start()
+        self.addCleanup(env.stop)
         self.root = root
         # 隔离本机真实配置（#133）：「未设置」用例要求 get() 看不到 env 文件与
         # 真实环境变量里的 JUDGE_BACKEND；空串覆盖会屏蔽全部下层来源
-        session_override("JUDGE_BACKEND", "")
-        self.addCleanup(session_override, "JUDGE_BACKEND", "")
+        overrides = mock.patch.dict(judge.userconfig._session_overrides,
+                                    {"JUDGE_BACKEND": ""})
+        overrides.start()
+        self.addCleanup(overrides.stop)
+        # These legacy local-model scenarios describe a supported ARM Mac, not
+        # whatever machine happens to run the API-only build's test suite.
+        for name, value in (("system", "Darwin"), ("machine", "arm64")):
+            platform = mock.patch.object(judge.runtime_mode.platform, name, return_value=value)
+            platform.start()
+            self.addCleanup(platform.stop)
 
     def _gate(self):
         return judge.download_block_reason()
@@ -174,6 +188,21 @@ class DownloadGateTests(unittest.TestCase):
         session_override("JUDGE_BACKEND", "skip")
         self.assertIn("3.8 GB", self._gate())
 
+    def test_intel_blocks_local_for_every_preference_and_cache_state(self):
+        for arch in ("x86_64", "amd64", "i386"):
+            for pref in ("", "local", "cloud", "skip", "api"):
+                for cached in (False, True):
+                    with self.subTest(arch=arch, preference=pref, cached=cached), \
+                         mock.patch.object(judge.runtime_mode.platform, "machine", return_value=arch), \
+                         mock.patch.object(judge, "model_cached", return_value=cached):
+                        session_override("JUDGE_BACKEND", pref)
+                        self.assertIn("API 模式", self._gate())
+
+    def test_arm_api_blocks_even_cached_model(self):
+        _fake_cache(self.root)
+        session_override("JUDGE_BACKEND", "api")
+        self.assertIn("API 模式", self._gate())
+
 
 class SettingsWriteTests(unittest.TestCase):
     def test_write_settings_accepts_judge_backend(self):
@@ -191,8 +220,10 @@ class SettingsWriteTests(unittest.TestCase):
 
 class SessionOverrideTests(unittest.TestCase):
     def test_override_beats_every_source(self):
+        overrides = mock.patch.dict(judge.userconfig._session_overrides)
+        overrides.start()
+        self.addCleanup(overrides.stop)
         session_override("JUDGE_BACKEND", "cloud")
-        self.addCleanup(session_override, "JUDGE_BACKEND", "")
         self.assertEqual(judge.userconfig.get("JUDGE_BACKEND"), "cloud")
         self.assertEqual(judge.download_block_reason(),
                          judge.download_block_reason())   # 不崩即可：门读同一个值
